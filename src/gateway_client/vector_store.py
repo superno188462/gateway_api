@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import asyncio
 from typing import Any, Awaitable, Callable
@@ -88,6 +89,15 @@ class GatewayVectorStore:
             except ValueError:
                 pass
             known_codes = {
+                "parent_record_not_found": "VECTOR_PARENT_NOT_FOUND",
+                "parent_record_in_use": "VECTOR_PARENT_IN_USE",
+                "parent_record_kind_invalid": "VECTOR_PARENT_KIND_INVALID",
+                "parent_record_scope_conflict": "VECTOR_PARENT_SCOPE_CONFLICT",
+                "published_version_immutable": "VECTOR_VERSION_IMMUTABLE",
+                "published_version_retired": "VECTOR_VERSION_RETIRED",
+                "publication_history_unknown": "VECTOR_PUBLICATION_HISTORY_UNKNOWN",
+                "staged_version_not_found": "VECTOR_STAGED_VERSION_NOT_FOUND",
+                "request_too_large": "VECTOR_REQUEST_TOO_LARGE",
                 "embedding_dimensions_conflict": "VECTOR_COLLECTION_DIMENSIONS_MISMATCH",
                 "embedding_dimensions_invalid": "VECTOR_EMBEDDING_DIMENSIONS_INVALID",
                 "embedding_response_invalid": "VECTOR_EMBEDDING_RESPONSE_INVALID",
@@ -184,16 +194,40 @@ class GatewayVectorStore:
         uncertain_ids identifies the current batch whose result is unconfirmed.
         No document lifecycle or text splitting takes place here.
         """
+        if any(item.get("record_kind", "vector") != "vector" for item in vectors):
+            raise GatewayVectorStoreError("VECTOR_GATEWAY_INVALID_REQUEST")
+        return await self.add_records(vectors, on_batch=on_batch)
+
+    async def add_records(self, vectors: list[dict[str, Any]], *,
+                          on_batch: Callable[[int, int], Awaitable[None]] | None = None) -> dict[str, Any]:
+        """写入预备好的普通/向量记录；调用方按父记录、子记录的顺序分别提交。"""
         ids = [item.get("id") for item in vectors]
-        if any(not isinstance(item.get("content"), str) or not item["content"].strip() or len(item["content"]) > 6000 or not isinstance(item.get("metadata", {}), dict) for item in vectors):
+        if any(item.get("record_kind", "vector") not in {"vector", "document"}
+               or not isinstance(item.get("content"), str) or not item["content"].strip()
+               or len(item["content"]) > (20000 if item.get("record_kind") == "document" else 6000)
+               or not isinstance(item.get("metadata", {}), dict) for item in vectors):
             raise GatewayVectorStoreError("VECTOR_GATEWAY_INVALID_REQUEST")
         if any(not isinstance(value, str) or not value or len(value) > 200 for value in ids):
             raise GatewayVectorStoreError("VECTOR_GATEWAY_INVALID_REQUEST")
         if len(ids) != len(set(ids)):
             raise GatewayVectorStoreError("VECTOR_DUPLICATE_RECORD_ID")
         confirmed: list[dict[str, Any]] = []
-        for offset in range(0, len(vectors), 64):
-            batch = vectors[offset:offset + 64]
+        batches: list[list[dict[str, Any]]] = []
+        batch: list[dict[str, Any]] = []
+        for record in vectors:
+            candidate = batch + [record]
+            if len(candidate) > 64 or len(json.dumps({"vectors": candidate}, ensure_ascii=True).encode("utf-8")) > 4 * 1024 * 1024:
+                if not batch:
+                    raise GatewayVectorStoreError("VECTOR_GATEWAY_INVALID_REQUEST")
+                batches.append(batch)
+                batch = [record]
+                if len(json.dumps({"vectors": batch}, ensure_ascii=True).encode("utf-8")) > 4 * 1024 * 1024:
+                    raise GatewayVectorStoreError("VECTOR_GATEWAY_INVALID_REQUEST")
+            else:
+                batch = candidate
+        if batch:
+            batches.append(batch)
+        for batch in batches:
             try:
                 result = await self._add_vector_batch(batch)
             except GatewayVectorStoreError as error:
@@ -230,6 +264,43 @@ class GatewayVectorStore:
             raise GatewayVectorStoreError("VECTOR_GATEWAY_INCOMPLETE_UPSERT")
         return result
 
+    async def fetch_records(self, ids: list[str]) -> dict[str, Any]:
+        """按外部 ID 读取已发布正文，保留 missing_ids，不调用 Embedding。"""
+        self.ensure_configured()
+        if any(not isinstance(value, str) or not value or len(value) > 200 for value in ids):
+            raise GatewayVectorStoreError("VECTOR_GATEWAY_INVALID_REQUEST")
+        requested = list(dict.fromkeys(ids))
+        records, missing = [], []
+        for offset in range(0, len(requested), 256):
+            batch = requested[offset:offset + 256]
+            result = await self._request("POST", f"/collections/{quote(self.collection, safe='')}/fetch", {"ids": batch})
+            if not isinstance(result, dict) or not isinstance(result.get("records"), list) or not isinstance(result.get("missing_ids"), list):
+                raise GatewayVectorStoreError("VECTOR_GATEWAY_INVALID_RESPONSE")
+            returned = result["records"]
+            if any(not isinstance(record, dict) or not isinstance(record.get("id"), str) for record in returned):
+                raise GatewayVectorStoreError("VECTOR_GATEWAY_INVALID_RESPONSE")
+            record_ids = [record["id"] for record in returned]
+            if any(not isinstance(value, str) for value in result["missing_ids"]):
+                raise GatewayVectorStoreError("VECTOR_GATEWAY_INVALID_RESPONSE")
+            accounted = record_ids + result["missing_ids"]
+            if len(accounted) != len(batch) or set(accounted) != set(batch):
+                raise GatewayVectorStoreError("VECTOR_GATEWAY_INVALID_RESPONSE")
+            by_id = {record["id"]: record for record in returned}
+            records.extend(by_id[value] for value in batch if value in by_id)
+            missing.extend(value for value in batch if value not in by_id)
+        return {"collection": self.collection, "records": records, "missing_ids": missing}
+
+    async def publish_version(self, namespace: str, document_id: str, version_id: str) -> dict[str, Any]:
+        """原子发布指定版本；超时可能已经生效，调用方须重试，不能删除目标记录。"""
+        self.ensure_configured()
+        if any(not isinstance(value, str) or not value or len(value) > 200 for value in (namespace, document_id, version_id)):
+            raise GatewayVectorStoreError("VECTOR_GATEWAY_INVALID_REQUEST")
+        result = await self._request("POST", f"/collections/{quote(self.collection, safe='')}/publish",
+                                     {"namespace": namespace, "document_id": document_id, "version_id": version_id})
+        if not isinstance(result, dict) or result.get("version_id") != version_id or type(result.get("published_records")) is not int:
+            raise GatewayVectorStoreError("VECTOR_GATEWAY_INVALID_RESPONSE")
+        return result
+
     async def delete(self, ids: list[str]) -> dict[str, Any]:
         """Compatibility alias for bounded bulk record deletion."""
         return await self.delete_vectors(ids)
@@ -239,10 +310,13 @@ class GatewayVectorStore:
             raise GatewayVectorStoreError("VECTOR_GATEWAY_INVALID_REQUEST")
         unique_ids = list(dict.fromkeys(ids))
         deleted = 0
+        deleted_ids, missing_ids = [], []
         for offset in range(0, len(unique_ids), 256):
             result = await self._delete_batch(unique_ids[offset:offset + 256])
             deleted += result["deleted"]
-        return {"collection": self.collection, "deleted": deleted}
+            deleted_ids.extend(result.get("deleted_ids", []))
+            missing_ids.extend(result.get("missing_ids", []))
+        return {"collection": self.collection, "deleted": deleted, "deleted_ids": deleted_ids, "missing_ids": missing_ids}
 
     async def _delete_batch(self, ids: list[str]) -> dict[str, Any]:
         self.ensure_configured()

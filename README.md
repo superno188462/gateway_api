@@ -4,6 +4,8 @@
 本项目是客户端 SDK，不是 Gateway 服务端，不需要启动 Web 服务。
 包名为 `agent-gateway-client`，Python 导入名为 `gateway_client`。
 
+完整中文说明见 [模块使用指南](docs/模块使用指南.md)：包含配置、向量检索、父子记录与发布、画像、长期记忆、会话消息和异常处理。
+
 ## 开发
 
 ```powershell
@@ -73,3 +75,28 @@ confirmed_ids 和 uncertain_ids；业务项目决定部分失败后的重试与�
 
 `src/gateway_client/` 是唯一 SDK 实现。Knowledge 中旧导入路径仅作为兼容转发层。
 SDK 不保存 API Key、不验证终端用户身份，也不直接读取业务数据库。
+
+## 0.2 父子记录与发布
+
+```python
+scope = dict(namespace="knowledge-platform:user-1", document_id="doc-1", version_id="version-1", staged=True)
+await client.add_records([
+    {"id": "parent-1", "record_kind": "document", "content": "父块正文",
+     "metadata": {"source": "手册.md"}, **scope}
+])
+await client.add_vectors([
+    {"id": "child-1", "parent_id": "parent-1", "content": "子片正文",
+     "metadata": {"source": "手册.md"}, **scope}
+])
+await client.publish_version("knowledge-platform:user-1", "doc-1", "version-1")
+hits = await client.similarity_search_with_context("问题", metadata={"source": "手册.md"})
+```
+
+add_records 支持 document（最多 20,000 字符）及 vector（最多 6,000 字符，业务仍需满足集合上限）；按 64 条和 4 MiB 双重限制分批。
+fetch_records 使用外部 ID，最多 256 个一批，返回 records/missing_ids。
+父块与子片先后提交，父子不能同批引用。父正文保存在 content，metadata 保持轻量。
+版本 ID 必须在业务侧持久化，同一版本重试保持不变；内容回退也需新的版本 ID。
+发布超时可能已生效，应重试同一 publish，不能清理目标版本。
+发布成功后先删除旧子片，再删除旧父块。SDK 不编排生命周期，也不提供数据库/队列。
+upsert 响应 id 是内部 UUID；external_id 才是 fetch/delete/parent_id 使用的调用方 ID。
+旧版 add_vectors 仍然可用。similarity_search_with_context 会保留每条子片命中，调用方自行按 parent_id 去重；metadata 过滤不能替代业务鉴权。
